@@ -16,31 +16,32 @@ function walkDir (dir) {
     return new Promise( (resolve, reject) => {
         fs.readdirAsync(dir)
             .then( (files)=> {
-                let count = files.length;
+                let pending = files.length;
                 return Promise.all( files.map( (file) => {
                         let filePath = path.join(dir, file);
                         return fs.statAsync(filePath)
                             .then( (stats) => {
                                 if (stats.isDirectory()) {
-                                    return walkDir(filePath).then( (res) => results = results.concat(res));
+                                    return walkDir(filePath).then( (res) => {
+                                        results = results.concat(res);
+                                        if (!--pending) return results;
+                                    });
                                 } else {
                                     results.push(filePath);
-                                    if (!--count) return results;
+                                    if (!--pending) return results;
                                 }
                             })
                             .catch( (err) => { reject(err); });
                 }));
             }).then ( () => {
                 resolve(results);
-            })
-            .catch( (err) => {
-                console.error(err.stack);
+            }).catch( (err) => {
                 reject(err);
             });
     });
 }
 
-function traverseDirParallel(dir, callback) {
+function walkDirParallel(dir, callback) {
     let results = [];
     fs.readdir(dir, (err, files) => {
         if (err) throw err;
@@ -53,7 +54,7 @@ function traverseDirParallel(dir, callback) {
                 results.push(filePath);
                 if (!--pending) { return callback(results); }
             } else {
-                traverseDirParallel(filePath, (ret) => {
+                walkDirParallel(filePath, (ret) => {
                     results = results.concat(ret);
                     if (!--pending) return callback(results);
                 });
@@ -62,7 +63,7 @@ function traverseDirParallel(dir, callback) {
     });
 }
 
-function traverseDirSerial(dir, callback) {
+function walkDirSerial(dir, callback) {
     let results = [];
     fs.readdir(dir, (err, files) => {
         if (err) throw err;
@@ -75,7 +76,7 @@ function traverseDirSerial(dir, callback) {
             let filePath = path.join(dir, file);
             fs.stat(filePath, (err, stats) => {
                 if (stats.isDirectory()) {
-                    traverseDirSerial(filePath, (res) => {
+                    walkDirSerial(filePath, (res) => {
                         results = results.concat(res);
                         next();
                     });
@@ -88,21 +89,14 @@ function traverseDirSerial(dir, callback) {
     });
 }
 
-// if (require.main === module) {
-//     let traverseDir = traverseDirSerial;
-//     traverseDir(process.cwd(), (result) => {
-//         console.log("list:", result.length);
-//     });
-// }
-//
 if (require.main === module) {
-    walkDir(process.cwd())
-        .then( (result) => {
-            // console.log(list);
-            console.log("list:", result.length);
-            console.log("done!");
-        })
-        .catch( (err) => {
-            console.error(err.stack);
-        });
+    walkDirSerial(process.cwd(), (result) => {
+        console.log("walkDirSerial's result.length:", result.length);
+    });
+    walkDirParallel(process.cwd(), (result) => {
+        console.log("walkDirParallel's result.length:", result.length);
+    });
+    walkDir(process.cwd()).then( (result) => {
+        console.log("walkDirPromise's result.length:", result.length);
+    });
 }
