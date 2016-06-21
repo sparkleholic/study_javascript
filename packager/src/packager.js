@@ -5,6 +5,8 @@ var Promise = require('bluebird'),
     fstream = require('fstream'),
     zlib = require('zlib'),
     CombinedStream = require('combined-stream'),
+    stream = require('stream'),
+    UglifyJS = require("uglify-js"),
     tarFilterPack = require('./tar-filter-pack'),
     Metadata = require('./metadata')
 
@@ -166,7 +168,7 @@ var mkdirp = Promise.promisify(require('mkdirp'));
             let packageProperties = {};
             //@see https://github.com/isaacs/node-tar/issues/7
             // it is a workaround for packaged ipk on windows can set +x into directory
-            var fixup = function(entry) {
+            var fixupDir = function(entry) {
                 // Make sure readable directories have execute permission
                 if (entry.props.type === "Directory") {
                     let maskingBits = 0o311;
@@ -177,15 +179,11 @@ var mkdirp = Promise.promisify(require('mkdirp'));
                     entry.props.mode |= (entry.props.mode >>> 2) & maskingBits;
                 }
 
-                if (options && options['minify']) {
-
-                }
-
                 return true;
             }
 
     		fstream
-    			.Reader( {path: inPath, type: 'Directory', filter: fixup } )
+    			.Reader( {path: inPath, type: 'Directory', filter: fixupDir } )
     			.pipe(tarFilterPack({ noProprietary: true, pathFilter: filter, permission : packageProperties }))
     			.pipe(zlib.createGzip())
     			.pipe(fstream.Writer(path.join(tempDir,output)))
@@ -210,27 +208,37 @@ var mkdirp = Promise.promisify(require('mkdirp'));
 
     function _constructTempDir (metaObjs, excludeOptions) {
         let tempDir = temp.path({prefix: 'com.webos.ares.cli'}) + '.d';
-        let _filter = function(_stat, _path, _file) {
+        let _filter = function (name) {
             var include = true;
-            if (excludeOptions) {
-                if ('file' === _stat && excludeOptions['extension'] === path.extname(_path)){
-                    include = false;
-                }
-            }
             return include;
         };
-        return _copyToTemp(metaObjs, DIR_TYPE.APP, '/data/usr/palm/applications', tempDir, _filter)
-            .then( ()=>_copyToTemp(metaObjs, DIR_TYPE.SERVICE, '/data/usr/palm/services', tempDir, _filter))
-            .then( ()=>_copyToTemp(metaObjs, DIR_TYPE.PACKAGE, '/data/usr/palm/packages', tempDir, _filter))
+        let _transform = function (read, write, file) {
+            if ('.js' === path.extname(file.name)) {
+                var T = new stream.Transform;
+                T._transform = function(chunk, encoding, cb) {
+                //   this.push(chunk.toString().toUpperCase());
+                  this.push(UglifyJS.minify(chunk.toString(), {fromString: true}).code);
+                  cb();
+                };
+
+                read.pipe(T)
+                    .pipe(write)
+                    .on('error', (err)=>{console.error("file:",file, ", err:", err)})
+            } else { read.pipe(write); }
+        }
+        return _copyToTemp(metaObjs, DIR_TYPE.APP, '/data/usr/palm/applications', tempDir, _filter, _transform)
+            .then( ()=>_copyToTemp(metaObjs, DIR_TYPE.SERVICE, '/data/usr/palm/services', tempDir, _filter, _transform))
+            .then( ()=>_copyToTemp(metaObjs, DIR_TYPE.PACKAGE, '/data/usr/palm/packages', tempDir, _filter, _transform))
             .then ( ()=>tempDir)
     }
 
-    function _copyToTemp (metaObjs, dirType, appendDir, tempDir, filterFunc) {
+    function _copyToTemp (metaObjs, dirType, appendDir, tempDir, filterFunc, transformFunc) {
         return Promise.all(metaObjs[dirType]).map( (metaObj)=>{
             let dir = path.join(tempDir, appendDir,  metaObj.data.getValue(metaObj.key) || '');
+            console.log("_copyToTemp:", dir);
             return mkdirp(dir)
                     .then( ()=>{
-                        return copyDir(metaObj.dir, dir, {"filter": filterFunc})
+                        return copyDir(metaObj.dir, dir, {"filter": filterFunc, "transform": transformFunc})
                             .then( ()=> {
                                 console.log("copy done:", dir);
                             })
