@@ -5,7 +5,14 @@
   "main": "./src/packager.js",
   "dependencies": {
     "babel-cli": "^6.10.1",
-    "bluebird": "^3.4.1"
+    "bluebird": "^3.4.1",
+    "combined-stream": "^1.0.5",
+    "fstream": "^1.0.10",
+    "inherits": "^1.0.0",
+    "mkdirp": "^0.5.1",
+    "ncp": "^2.0.0",
+    "tar": "^2.2.1",
+    "temp": "^0.8.3"
   },
   "devDependencies": {
     "mocha": "^2.5.3"
