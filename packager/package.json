@@ -11,9 +11,10 @@
     "inherits": "^1.0.0",
     "mkdirp": "^0.5.1",
     "ncp": "^2.0.0",
+    "npmlog": "^3.1.2",
     "tar": "^2.2.1",
     "temp": "^0.8.3",
-    "uglify-js": "^2.6.3"
+    "uglify-js": "^2.5.0"
   },
   "devDependencies": {
     "mocha": "^2.5.3"

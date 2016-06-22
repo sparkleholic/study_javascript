@@ -7,6 +7,7 @@ var Promise = require('bluebird'),
     CombinedStream = require('combined-stream'),
     stream = require('stream'),
     UglifyJS = require("uglify-js"),
+    log = require('npmlog'),
     tarFilterPack = require('./tar-filter-pack'),
     Metadata = require('./metadata')
 
@@ -16,6 +17,10 @@ var mkdirp = Promise.promisify(require('mkdirp'));
 
 (function () {
     'use strict';
+
+    log.heading = 'packager';
+    log.level = 'warn';
+
     const DIR_TYPE = {
         'APP': 0,
         'SERVICE': 1,
@@ -29,8 +34,8 @@ var mkdirp = Promise.promisify(require('mkdirp'));
     };
     const METADATA_KEY = {
         'appinfo.json' : "id",
-        'package.json': "name",
         'services.json': "id",
+        'package.json': "name",
         'packageinfo.json': "id"
     }
 
@@ -41,21 +46,32 @@ var mkdirp = Promise.promisify(require('mkdirp'));
         },
 
         genPackage: function(inDirs, destDir, options, next) {
+            let tempDir;
+
             if (! inDirs instanceof Array || !inDirs) { return next(new Error('invalid parameters')); };
-            _classifyMetaFile(inDirs)
-            .then( (fileInfos)=> {
-                let metaFile= {};
-                if (fileInfos.length < 1) { return next(new Error('failure finding metafiles'));}
-                fileInfos.forEach( (info)=> {
-                    for (let i in info ) { metaFile[info[i]] = [].concat(i); }
-                })
-                if (!metaFile[DIR_TYPE.APP] || metaFile[DIR_TYPE.APP].length > 1) {
-                    return next(new Error('failure finding app directory')); }
-                return metaFile;
+            _findMetaFiles(inDirs)
+            .then ( (metafileMap) => _loadMetadata(metafileMap) )
+            .then ( (infos) => {
+                /* info
+                {
+                    DIR_TYPE.APP : [{ dir: path, file: metaFilePath, data: metadata (obj) }],
+                    ...
+                }
+                */
+                return _prepareElements(infos, options)
             })
-            .then ( _loadMetadata )
-            .then ( _constructTempDir )
-            .then ( (tempDir) => _outputPackage(tempDir, destDir) )
+            .then ( (workDirInfos) => {
+                /* workDirInfos
+                {
+
+                    DIR_TYPE.APP : [{ dir: path, file: metaFilePath, data: metadata (obj) }],
+                    ...
+                }
+                */
+                tempDir = workDirInfos['TEMP-INFO']['tempDir']; //temp = working-dir
+                return _fillElements(workDirInfos, options);
+            })
+            .then ( () => _outputPackage(tempDir, destDir) )
             .then ( (ipkFile) => next(null, {ipk:ipkFile, msg: "Success"}) )
             .catch( (err) => {return next(err)} )
         },
@@ -69,11 +85,11 @@ var mkdirp = Promise.promisify(require('mkdirp'));
         let ctrlDir = path.join(tempDir, "ctrl");
 
         return _makeTgz(tempDir, 'data', 'data.tar.gz')
-        .then( () => mkdirp(path.join(tempDir, "ctrl")))
-        .then( () => _createControlFile({}, path.join(ctrlDir, 'control')))
-        .then( () => _makeTgz(tempDir, 'ctrl', 'control.tar.gz'))
-        .then( () => _createDebianBinary(path.join(tempDir, "debian-binary")))
-        .then( () => _makeIpk(tempDir, destDir, 'test.ipk'));
+            .then( () => mkdirp(path.join(tempDir, "ctrl")))
+            .then( () => _createControlFile({}, path.join(ctrlDir, 'control')))
+            .then( () => _makeTgz(tempDir, 'ctrl', 'control.tar.gz'))
+            .then( () => _createDebianBinary(path.join(tempDir, "debian-binary")))
+            .then( () => _makeIpk(tempDir, destDir, 'test.ipk'));
     }
 
     function _padSpace(input,length) {
@@ -136,7 +152,7 @@ var mkdirp = Promise.promisify(require('mkdirp'));
     function _createControlFile(pkgInfo, writeFile) {
 
         var lines = [
-			"Package: " + pkgInfo.name || 'test',
+			"Package: " + pkgInfo.name || 'com.u.a',
 			"Version: " + pkgInfo.version || '1.0.0',
 			"Section: misc",
 			"Priority: optional",
@@ -192,56 +208,181 @@ var mkdirp = Promise.promisify(require('mkdirp'));
         });
     }
 
-    function _classifyMetaFile(inDirs) {
+    function _findMetaFiles(inDirs) {
         return Promise.all(inDirs)
                     .map( (inDir)=>{
                         for (let f in METAFILE) {
                             let file = path.join(inDir,f);
                             if (fs.existsSync(file)) {
-                                let info = {};
-                                info[file] = METAFILE[f];
-                                return info;
+                                let type = {};
+                                type[file] = METAFILE[f];
+                                return type;
                             }
                         }
-                    });
+                    })
+                    .then( (fileTypes) => {
+                        let metaFileMap= {};
+                        fileTypes.forEach( (type)=> {
+                            for (let i in type) {
+                                metaFileMap[type[i]] = [].concat(i);
+                            }
+                        });
+                        return metaFileMap;
+                    } );
     }
 
-    function _constructTempDir (metaObjs, excludeOptions) {
+    /**
+     * @method _fillElements
+     * @param {object} wDirInfos - directory infos '{ DIR_TYPE: [dir:path, file:path, data: json] , ...}'
+     * @param {object} options - undefined
+     * @returns {type} packageInfo - package info '{id, version, etc}'
+     * @description write packageinfo.json
+     * @example
+     * ` ``js
+     *
+     * ` ``
+     */
+    function _fillElements (wDirInfos, options) {
+        let packageInfo,
+            packageDir,
+            packageFile,
+            data,
+            tempDirInfo = wDirInfos['TEMP-INFO'];
+            console.log("tempDirInfo:", tempDirInfo);
+        if (wDirInfos[DIR_TYPE.PACKAGE].length < 1) {
+            let serviceIDs = wDirInfos[DIR_TYPE.SERVICE].map( (dirInfo) => {
+                let data = dirInfo['data'],
+                    key = dirInfo['key'];
+                return data.getValue(key);
+            });
+            let metadata = wDirInfos[DIR_TYPE.APP][0]['data'];
+            let appInfo = metadata.getData();
+            packageInfo = _fillPackageInfo(appInfo, serviceIDs);
+            data = JSON.stringify(packageInfo, null, 2) + "\n";
+            packageDir = path.join(tempDirInfo['packageTempRoot'], packageInfo['id']);
+            packageFile = path.join(packageDir, 'packageinfo.json');
+            return mkdirp(packageDir)
+                .then( () => fs.writeFileAsync(packageFile, data) )
+                .then( () => packageInfo )
+                .catch( (err) => { throw err; });
+        } else {
+            packageDir = wDirInfos[DIR_TYPE.PACKAGE][0]['workDir'];
+            packageFile = path.join(packageDir, 'packageinfo.json');
+            return fs.readFileAsync(packageFile);
+        }
+    }
+
+    function _fillPackageInfo(appinfo, serviceIDs) {
+        let pkginfo = {
+            "app": appinfo.id,
+            "id": appinfo.id,
+            "loc_name": appinfo.title,
+            "package_format_version": appinfo.uiRevision,      // TODO: Ok ?
+            "vendor": appinfo.vendor,
+            "version": appinfo.version || "1.0.0"
+        };
+        if (serviceIDs.length > 0) {
+            pkginfo["services"] = serviceIDs;
+        }
+        return pkginfo;
+    }
+
+    /**
+     * @method _prepareElements
+     * @param {object} dirInfos - directory infos '{ DIR_TYPE: [dir:path, file:metafile, data: metadata(json)] , ...}'
+     * @param {object} options - undefined
+     * @returns {type} workInfos - working directory infos '{ DIR_TYPE: [dir:path, file:path, data: json, workDir: path] , ...}'
+     * @description copy directories to working directories and return working directories information
+     * @example
+     * ` ``js
+     *
+     * ` ``
+     */
+    function _prepareElements (dirInfos, options) {
         let tempDir = temp.path({prefix: 'com.webos.ares.cli'}) + '.d';
         let _filter = function (name) {
             var include = true;
             return include;
         };
         let _transform = function (read, write, file) {
-            if ('.js' === path.extname(file.name)) {
-                var T = new stream.Transform;
-                T._transform = function(chunk, encoding, cb) {
-                //   this.push(chunk.toString().toUpperCase());
-                  this.push(UglifyJS.minify(chunk.toString(), {fromString: true}).code);
-                  cb();
-                };
+            if ('.js' === path.extname(file.name) &&
+                    file.name.indexOf('node_modules') === -1) {
+                let sourceMapFile = write.path + '.map';
+                let uglifiedCode = UglifyJS.minify(file.name, {
+                    fromString: false,
+                    mangle: {
+                        except: ['require', 'request']
+                    },
+                    output: {
+                        space_colon: false,
+                        beautify: false,
+                        semicolons: false
+                    },
+                    outSourceMap: path.basename(sourceMapFile),
+                    sourceMapIncludeSources: true
+                });
 
-                read.pipe(T)
-                    .pipe(write)
-                    .on('error', (err)=>{console.error("file:",file, ", err:", err)})
+                read.close();
+                if (uglifiedCode.map) {
+                    let sMap = JSON.parse(uglifiedCode.map);
+                    let rewriteSources = sMap.sources.map( (source) => {
+                        return path.relative(copyDir.options.srcDir, source); //FIXME: TBD
+                    });
+                    sMap.sources = rewriteSources;
+                    uglifiedCode.map = JSON.stringify(sMap);
+                    let writeSm = fs.createWriteStream(sourceMapFile, { mode: 0o666} );
+                    writeSm.write(uglifiedCode.map, 'utf8', (err)=> {
+                        if(err) console.error("writing-err:", err, "at", sourceMapFile);
+                        writeSm.end();
+                    });
+                }
+                write.write(uglifiedCode.code, 'utf8', (err)=> {
+                    if(err) console.error("writing-err:", err, "at", file.name);
+                    write.end();
+                });
             } else { read.pipe(write); }
         }
-        return _copyToTemp(metaObjs, DIR_TYPE.APP, '/data/usr/palm/applications', tempDir, _filter, _transform)
-            .then( ()=>_copyToTemp(metaObjs, DIR_TYPE.SERVICE, '/data/usr/palm/services', tempDir, _filter, _transform))
-            .then( ()=>_copyToTemp(metaObjs, DIR_TYPE.PACKAGE, '/data/usr/palm/packages', tempDir, _filter, _transform))
-            .then ( ()=>tempDir)
+        let appTempRoot = path.join(tempDir, '/data/usr/palm/applications'),
+            serviceTempRoot = path.join(tempDir, '/data/usr/palm/services'),
+            packageTempRoot = path.join(tempDir, '/data/usr/palm/packages');
+
+        return _copyToTemp(dirInfos, DIR_TYPE.APP, appTempRoot, _filter, _transform)
+            .then( (infos)=>{
+                dirInfos[DIR_TYPE.APP] = infos;
+                return _copyToTemp(dirInfos, DIR_TYPE.SERVICE, serviceTempRoot, _filter, _transform);
+            })
+            .then( (infos)=>{
+                dirInfos[DIR_TYPE.SERVICE] = infos;
+                return _copyToTemp(dirInfos, DIR_TYPE.PACKAGE, packageTempRoot, _filter, _transform)
+            })
+            .then ( (infos)=>{
+                dirInfos[DIR_TYPE.PACKAGE] = infos;
+                dirInfos['TEMP-INFO'] = {   //FIXME: TBD
+                    tempDir: tempDir,
+                    appTempRoot: appTempRoot,
+                    serviceTempRoot: serviceTempRoot,
+                    packageTempRoot:  packageTempRoot
+                }
+                return dirInfos;
+            })
     }
 
-    function _copyToTemp (metaObjs, dirType, appendDir, tempDir, filterFunc, transformFunc) {
-        return Promise.all(metaObjs[dirType]).map( (metaObj)=>{
-            let dir = path.join(tempDir, appendDir,  metaObj.data.getValue(metaObj.key) || '');
-            console.log("_copyToTemp:", dir);
+    function _copyToTemp (dirInfos, dirType, tempDir, filterFunc, transformFunc) {
+        return Promise.all(dirInfos[dirType]).map( (dirInfo)=>{
+            let dir = path.join(tempDir,  dirInfo.data.getValue(dirInfo.key) || '');
+            copyDir.options = { //FIXME: this variable is being used in the filter func.
+                srcDir: dirInfo.dir,
+                dstDir: dir,
+                type: dirType
+            }
             return mkdirp(dir)
                     .then( ()=>{
-                        return copyDir(metaObj.dir, dir, {"filter": filterFunc, "transform": transformFunc})
+                        return copyDir(dirInfo.dir, dir, {"filter": filterFunc, "transform": transformFunc})
                             .then( ()=> {
-                                console.log("copy done:", dir);
+                                dirInfo['workDir'] = dir;
+                                return dirInfo;
                             })
+                            .catch( (err)=> { throw err;} )
                     });
             });
     }
@@ -262,16 +403,10 @@ var mkdirp = Promise.promisify(require('mkdirp'));
             return Promise.all(packageMetaFiles.map(_metadata)).then( (metaObjs)=> {
                 result[DIR_TYPE.PACKAGE] = metaObjs;
             })
-        }).then( ()=> {
-            return result;
-        })
+        }).then( ()=> result )
 /* return type
         {
-            DIR_TYPE.APP : [{
-                dir: path,
-                file: metaFilePath,
-                data: metadata (obj)
-            }],
+            DIR_TYPE.APP : [{ dir: path, file: metaFilePath, data: metadata (obj) }],
             ...
         }
 */
